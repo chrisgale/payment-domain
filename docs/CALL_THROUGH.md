@@ -161,7 +161,7 @@ Experience API caller
 
 ---
 
-### `DELETE /mandates/{mandateId}`
+### `DELETE /mandates/{paymentAgreementId}`
 > *Revoke a payment agreement*
 
 ```
