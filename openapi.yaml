@@ -1,0 +1,515 @@
+openapi: 3.1.0
+info:
+  title: Payment Domain API
+  version: 1.0.0
+  description: |
+    Internal domain API. Not experience-shaped. Called by payment-experience and other experiences.
+    All mutating endpoints require an Idempotency-Key header.
+servers:
+  - url: http://localhost:3011
+    description: Local sandbox
+  - url: https://payment-domain.internal.holidayextras.com
+    description: Internal (not public)
+
+paths:
+
+  # ── PAYMENT METHODS ──────────────────────────────────────────────────────────
+
+  /v1/payment-methods/sessions:
+    post:
+      summary: Create a card capture session
+      description: |
+        Creates a PCI-compliant card capture session. The PSP returns a redirect URL.
+        The caller redirects the customer there; on return the card is tokenised.
+        The token is stored against the customer and returned in the callback.
+      operationId: createCardCaptureSession
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerId, returnUrl, cancelUrl]
+              properties:
+                customerId:
+                  type: string
+                  example: "cust_HX_7823641"
+                returnUrl:
+                  type: string
+                  example: "https://payment.holidayextras.com/card-saved"
+                cancelUrl:
+                  type: string
+                  example: "https://payment.holidayextras.com/card-cancel"
+                context:
+                  type: string
+                  description: Optional label for logging (e.g. 'hotel-wizard-checkout')
+                  example: "hotel-wizard-checkout"
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              example:
+                cardCaptureSessionId: "ccs_3F9A2B1C"
+                redirectUrl: "https://secure.worldpay.com/hpp/paymentPage?token=abc123"
+                expiresAt: "2026-07-01T07:30:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/payment-methods/{customerId}:
+    get:
+      summary: Get stored payment methods for a customer
+      operationId: getPaymentMethods
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "cust_HX_7823641"
+      responses:
+        '200':
+          description: Payment methods
+          content:
+            application/json:
+              example:
+                customerId: "cust_HX_7823641"
+                paymentMethods:
+                  - paymentMethodToken: "pm_4X7K2M9N"
+                    type: "card"
+                    scheme: "visa"
+                    lastFour: "4242"
+                    expiryMonth: 9
+                    expiryYear: 2027
+                    isDefault: true
+                    hasActiveAgreement: false
+                    storedAt: "2025-11-03T14:22:00Z"
+                  - paymentMethodToken: "pm_8B3J5L1P"
+                    type: "card"
+                    scheme: "mastercard"
+                    lastFour: "1234"
+                    expiryMonth: 3
+                    expiryYear: 2026
+                    isDefault: false
+                    hasActiveAgreement: true
+                    storedAt: "2024-06-18T09:10:00Z"
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/payment-methods/{customerId}/{paymentMethodToken}:
+    delete:
+      summary: Remove a stored payment method
+      operationId: removePaymentMethod
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: paymentMethodToken
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Removed
+        '409':
+          description: Cannot remove — active payment agreement exists
+          content:
+            application/json:
+              example:
+                error: "ACTIVE_AGREEMENT"
+                message: "Revoke the payment agreement before removing this payment method"
+                paymentAgreementId: "pa_2C8F4A7E"
+
+  # ── AUTHORISATIONS ───────────────────────────────────────────────────────────
+
+  /v1/authorisations:
+    post:
+      summary: Authorise a payment on token
+      description: |
+        Authorises a payment against a stored payment method token.
+        Does NOT capture — a separate capture call is required.
+        Requires SCA consent proof (paymentConsentId) for MIT or high-value CIT.
+      operationId: authorisePayment
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentMethodToken, amount, currency, bookingReference]
+            example:
+              paymentMethodToken: "pm_4X7K2M9N"
+              amount: 19500
+              currency: "GBP"
+              bookingReference: "HX-2026-005678"
+              paymentConsentId: "pci_9D2E5F8G"
+              paymentAgreementId: "pa_2C8F4A7E"
+              statementDescriptor: "HX HOTEL GATWICK 01JUL"
+              initiationType: "MIT"
+      responses:
+        '201':
+          description: Authorised — awaiting capture
+          content:
+            application/json:
+              example:
+                authorisationId: "auth_7H3K9M2P"
+                status: "AUTHORISED"
+                amount: 19500
+                currency: "GBP"
+                bookingReference: "HX-2026-005678"
+                scaToken: "sca_R4T8W2X1"
+                authorisedAt: "2026-07-01T06:00:00Z"
+                captureBy: "2026-07-02T06:00:00Z"
+        '402':
+          description: Declined
+          content:
+            application/json:
+              example:
+                error: "PAYMENT_DECLINED"
+                declineCode: "DO_NOT_HONOUR"
+                message: "Payment declined by issuer"
+        '422':
+          description: SCA required
+          content:
+            application/json:
+              example:
+                error: "SCA_REQUIRED"
+                message: "Strong Customer Authentication is required for this transaction"
+                scaSessionId: "sca_R4T8W2X1"
+
+  /v1/authorisations/{authorisationId}/capture:
+    post:
+      summary: Capture an authorised payment
+      operationId: capturePayment
+      parameters:
+        - name: authorisationId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            example:
+              amount: 19500
+      responses:
+        '200':
+          description: Captured
+          content:
+            application/json:
+              example:
+                authorisationId: "auth_7H3K9M2P"
+                status: "CAPTURED"
+                amount: 19500
+                currency: "GBP"
+                capturedAt: "2026-07-01T06:00:05Z"
+        '409':
+          description: Cannot capture — wrong state
+          content:
+            application/json:
+              example:
+                error: "INVALID_STATE"
+                currentStatus: "CANCELLED"
+
+  /v1/authorisations/{authorisationId}/cancel:
+    post:
+      summary: Cancel / void an authorisation
+      operationId: cancelAuthorisation
+      parameters:
+        - name: authorisationId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              example:
+                authorisationId: "auth_7H3K9M2P"
+                status: "CANCELLED"
+                cancelledAt: "2026-07-01T06:01:00Z"
+
+  # ── SCA SESSIONS ─────────────────────────────────────────────────────────────
+
+  /v1/sca/sessions:
+    post:
+      summary: Initiate an SCA challenge
+      description: |
+        Creates an SCA session. The caller redirects the customer to the challengeUrl.
+        On completion the PSP calls back and the session status updates to COMPLETED.
+        On success, use the returned paymentConsentId for subsequent MIT or high-value CIT.
+      operationId: initiateScaSession
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example:
+              customerId: "cust_HX_7823641"
+              paymentMethodToken: "pm_4X7K2M9N"
+              amount: 19500
+              currency: "GBP"
+              bookingReference: "HX-2026-005678"
+              returnUrl: "https://payment.holidayextras.com/sca-complete"
+              cancelUrl: "https://payment.holidayextras.com/sca-cancel"
+      responses:
+        '201':
+          description: SCA session created
+          content:
+            application/json:
+              example:
+                scaSessionId: "scas_4B7D2F9H"
+                status: "PENDING"
+                challengeUrl: "https://3ds.worldpay.com/challenge?session=scas_4B7D2F9H"
+                expiresAt: "2026-07-01T06:30:00Z"
+
+  /v1/sca/sessions/{scaSessionId}:
+    get:
+      summary: Get SCA session status
+      operationId: getScaSession
+      parameters:
+        - name: scaSessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Session status
+          content:
+            application/json:
+              example:
+                scaSessionId: "scas_4B7D2F9H"
+                status: "COMPLETED"
+                paymentConsentId: "pci_9D2E5F8G"
+                completedAt: "2026-07-01T06:05:22Z"
+    put:
+      summary: Complete an SCA session (PSP callback handler)
+      description: Called by the PSP adapter when the SCA challenge completes. Not called directly by experience layers.
+      operationId: completeScaSession
+      parameters:
+        - name: scaSessionId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example:
+              outcome: "AUTHENTICATED"
+              psrRef: "3DS_AUTH_XY9Z"
+      responses:
+        '200':
+          description: Session updated
+          content:
+            application/json:
+              example:
+                scaSessionId: "scas_4B7D2F9H"
+                status: "COMPLETED"
+                paymentConsentId: "pci_9D2E5F8G"
+
+  # ── PAYMENT AGREEMENTS (MIT MANDATES) ────────────────────────────────────────
+
+  /v1/payment-agreements:
+    post:
+      summary: Register a payment agreement (MIT mandate)
+      description: |
+        Registers a Merchant Initiated Transaction agreement — the customer's consent
+        for HX to charge their card without an active SCA session (e.g. balance collection).
+        Requires a valid paymentConsentId from a completed SCA session.
+      operationId: registerPaymentAgreement
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example:
+              customerId: "cust_HX_7823641"
+              paymentMethodToken: "pm_4X7K2M9N"
+              paymentConsentId: "pci_9D2E5F8G"
+              agreementType: "BALANCE_COLLECTION"
+              description: "Holiday Extras balance collection agreement"
+      responses:
+        '201':
+          description: Agreement registered
+          content:
+            application/json:
+              example:
+                paymentAgreementId: "pa_2C8F4A7E"
+                customerId: "cust_HX_7823641"
+                paymentMethodToken: "pm_4X7K2M9N"
+                status: "ACTIVE"
+                agreementType: "BALANCE_COLLECTION"
+                registeredAt: "2026-07-01T06:00:00Z"
+
+  /v1/payment-agreements/{paymentAgreementId}:
+    get:
+      summary: Get a payment agreement
+      operationId: getPaymentAgreement
+      parameters:
+        - name: paymentAgreementId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Agreement
+          content:
+            application/json:
+              example:
+                paymentAgreementId: "pa_2C8F4A7E"
+                customerId: "cust_HX_7823641"
+                paymentMethodToken: "pm_4X7K2M9N"
+                status: "ACTIVE"
+                agreementType: "BALANCE_COLLECTION"
+                registeredAt: "2026-07-01T06:00:00Z"
+                lastUsedAt: null
+    delete:
+      summary: Revoke a payment agreement
+      operationId: revokePaymentAgreement
+      parameters:
+        - name: paymentAgreementId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              example:
+                paymentAgreementId: "pa_2C8F4A7E"
+                status: "REVOKED"
+                revokedAt: "2026-07-01T08:00:00Z"
+
+  # ── SETTLEMENT RULES ─────────────────────────────────────────────────────────
+
+  /v1/settlement-rules/{productType}:
+    get:
+      summary: Get settlement rules for a product type
+      description: |
+        Returns the business rule for when payment must be settled for a given product type.
+        This is a domain-owned business rule — not calculated in the experience layer.
+      operationId: getSettlementRules
+      parameters:
+        - name: productType
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [hotel, parking, lounge, insurance, transfer]
+          example: hotel
+      responses:
+        '200':
+          description: Settlement rules
+          content:
+            application/json:
+              examples:
+                hotel:
+                  value:
+                    productType: "hotel"
+                    settlementRule: "BEFORE_CHECKIN"
+                    offsetHours: 24
+                    description: "Payment must be settled at least 24 hours before check-in"
+                parking:
+                  value:
+                    productType: "parking"
+                    settlementRule: "BEFORE_DEPARTURE"
+                    offsetHours: 48
+                    description: "Payment must be settled at least 48 hours before departure"
+                lounge:
+                  value:
+                    productType: "lounge"
+                    settlementRule: "BEFORE_ENTRY"
+                    offsetHours: 0
+                    description: "Payment must be settled before lounge entry — no grace period"
+                insurance:
+                  value:
+                    productType: "insurance"
+                    settlementRule: "AT_PURCHASE"
+                    offsetHours: 0
+                    description: "Payment settled at point of purchase — no deferred collection"
+
+  # ── TRANSACTION LEDGER ───────────────────────────────────────────────────────
+
+  /v1/transactions/{bookingReference}:
+    get:
+      summary: Get payment transaction history for a booking/policy/order
+      operationId: getTransactions
+      parameters:
+        - name: bookingReference
+          in: path
+          required: true
+          schema: { type: string }
+          example: "HX-2026-005678"
+      responses:
+        '200':
+          description: Transaction history
+          content:
+            application/json:
+              example:
+                bookingReference: "HX-2026-005678"
+                totalAmount: 29500
+                capturedAmount: 10000
+                outstandingAmount: 19500
+                currency: "GBP"
+                transactions:
+                  - transactionId: "txn_1A2B3C4D"
+                    type: "CAPTURE"
+                    amount: 10000
+                    currency: "GBP"
+                    status: "SETTLED"
+                    paymentMethodToken: "pm_4X7K2M9N"
+                    capturedAt: "2026-06-01T10:00:00Z"
+                    authorisationId: "auth_5E6F7G8H"
+                  - transactionId: "txn_9I0J1K2L"
+                    type: "AUTHORISATION"
+                    amount: 19500
+                    currency: "GBP"
+                    status: "AUTHORISED"
+                    paymentMethodToken: "pm_4X7K2M9N"
+                    authorisedAt: "2026-07-01T06:00:00Z"
+                    captureBy: "2026-07-02T06:00:00Z"
+                    authorisationId: "auth_7H3K9M2P"
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID generated by caller. Same key on retry returns the same response without re-executing.
+      schema:
+        type: string
+        format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440000"
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          example:
+            error: "BAD_REQUEST"
+            message: "Missing required field: customerId"
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          example:
+            error: "NOT_FOUND"
+            message: "Resource not found"
