@@ -5,6 +5,20 @@ info:
   description: |
     Internal domain API. Not experience-shaped. Called by payment-experience and other experiences.
     All mutating endpoints require an Idempotency-Key header.
+
+    ## Time fields — contract
+
+    Every resource that can expire or has an action deadline includes explicit ISO 8601 datetime fields.
+    Callers must never compute deadlines themselves — the API tells you.
+
+    | Field | Meaning |
+    |---|---|
+    | `expiresAt` | This resource becomes invalid at this time — do not use after this point |
+    | `captureBy` | This authorisation will void if not captured by this time |
+    | `settlementDeadline` | Payment must reach settled status by this time |
+    | `respondBy` | Caller must act (e.g. complete SCA challenge) by this time |
+    | `revokedAt` / `cancelledAt` / `completedAt` | Audit timestamps — when a terminal state was reached |
+
 servers:
   - url: http://localhost:3011
     description: Local sandbox
@@ -13,15 +27,12 @@ servers:
 
 paths:
 
-  # ── PAYMENT METHODS ──────────────────────────────────────────────────────────
-
   /v1/payment-methods/sessions:
     post:
       summary: Create a card capture session
       description: |
-        Creates a PCI-compliant card capture session. The PSP returns a redirect URL.
-        The caller redirects the customer there; on return the card is tokenised.
-        The token is stored against the customer and returned in the callback.
+        Creates a PCI-compliant card capture session. Returns a redirect URL and an explicit
+        `expiresAt` — the session is invalid after that time and a new one must be created.
       operationId: createCardCaptureSession
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -29,23 +40,11 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [customerId, returnUrl, cancelUrl]
-              properties:
-                customerId:
-                  type: string
-                  example: "cust_HX_7823641"
-                returnUrl:
-                  type: string
-                  example: "https://payment.holidayextras.com/card-saved"
-                cancelUrl:
-                  type: string
-                  example: "https://payment.holidayextras.com/card-cancel"
-                context:
-                  type: string
-                  description: Optional label for logging (e.g. 'hotel-wizard-checkout')
-                  example: "hotel-wizard-checkout"
+            example:
+              customerId: "cust_HX_7823641"
+              returnUrl: "https://payment.holidayextras.com/card-saved"
+              cancelUrl: "https://payment.holidayextras.com/card-cancel"
+              context: "hotel-wizard-checkout"
       responses:
         '201':
           description: Session created
@@ -54,7 +53,9 @@ paths:
               example:
                 cardCaptureSessionId: "ccs_3F9A2B1C"
                 redirectUrl: "https://secure.worldpay.com/hpp/paymentPage?token=abc123"
-                expiresAt: "2026-07-01T07:30:00Z"
+                createdAt: "2026-07-01T06:00:00Z"
+                expiresAt: "2026-07-01T06:30:00Z"
+                respondBy: "2026-07-01T06:30:00Z"
         '400':
           $ref: '#/components/responses/BadRequest'
 
@@ -66,9 +67,7 @@ paths:
         - name: customerId
           in: path
           required: true
-          schema:
-            type: string
-          example: "cust_HX_7823641"
+          schema: { type: string }
       responses:
         '200':
           description: Payment methods
@@ -83,6 +82,7 @@ paths:
                     lastFour: "4242"
                     expiryMonth: 9
                     expiryYear: 2027
+                    cardExpiresAt: "2027-09-30T23:59:59Z"
                     isDefault: true
                     hasActiveAgreement: false
                     storedAt: "2025-11-03T14:22:00Z"
@@ -92,6 +92,7 @@ paths:
                     lastFour: "1234"
                     expiryMonth: 3
                     expiryYear: 2026
+                    cardExpiresAt: "2026-03-31T23:59:59Z"
                     isDefault: false
                     hasActiveAgreement: true
                     storedAt: "2024-06-18T09:10:00Z"
@@ -124,15 +125,13 @@ paths:
                 message: "Revoke the payment agreement before removing this payment method"
                 paymentAgreementId: "pa_2C8F4A7E"
 
-  # ── AUTHORISATIONS ───────────────────────────────────────────────────────────
-
   /v1/authorisations:
     post:
       summary: Authorise a payment on token
       description: |
         Authorises a payment against a stored payment method token.
-        Does NOT capture — a separate capture call is required.
-        Requires SCA consent proof (paymentConsentId) for MIT or high-value CIT.
+        Does NOT capture — a separate capture call is required before `captureBy` or the
+        authorisation voids automatically.
       operationId: authorisePayment
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -140,9 +139,6 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [paymentMethodToken, amount, currency, bookingReference]
             example:
               paymentMethodToken: "pm_4X7K2M9N"
               amount: 19500
@@ -166,6 +162,7 @@ paths:
                 scaToken: "sca_R4T8W2X1"
                 authorisedAt: "2026-07-01T06:00:00Z"
                 captureBy: "2026-07-02T06:00:00Z"
+                expiresAt: "2026-07-02T06:00:00Z"
         '402':
           description: Declined
           content:
@@ -186,6 +183,7 @@ paths:
   /v1/authorisations/{authorisationId}/capture:
     post:
       summary: Capture an authorised payment
+      description: Must be called before the `captureBy` time on the authorisation.
       operationId: capturePayment
       parameters:
         - name: authorisationId
@@ -208,14 +206,17 @@ paths:
                 status: "CAPTURED"
                 amount: 19500
                 currency: "GBP"
+                authorisedAt: "2026-07-01T06:00:00Z"
                 capturedAt: "2026-07-01T06:00:05Z"
         '409':
-          description: Cannot capture — wrong state
+          description: Cannot capture — wrong state or expired
           content:
             application/json:
               example:
                 error: "INVALID_STATE"
-                currentStatus: "CANCELLED"
+                currentStatus: "EXPIRED"
+                captureBy: "2026-07-02T06:00:00Z"
+                message: "Authorisation expired — a new authorisation is required"
 
   /v1/authorisations/{authorisationId}/cancel:
     post:
@@ -235,17 +236,16 @@ paths:
               example:
                 authorisationId: "auth_7H3K9M2P"
                 status: "CANCELLED"
+                authorisedAt: "2026-07-01T06:00:00Z"
                 cancelledAt: "2026-07-01T06:01:00Z"
-
-  # ── SCA SESSIONS ─────────────────────────────────────────────────────────────
 
   /v1/sca/sessions:
     post:
       summary: Initiate an SCA challenge
       description: |
-        Creates an SCA session. The caller redirects the customer to the challengeUrl.
-        On completion the PSP calls back and the session status updates to COMPLETED.
-        On success, use the returned paymentConsentId for subsequent MIT or high-value CIT.
+        Creates an SCA session. The caller redirects the customer to `challengeUrl`.
+        The customer must complete the challenge before `respondBy` — after that the session
+        expires and a new one is required.
       operationId: initiateScaSession
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -270,7 +270,9 @@ paths:
                 scaSessionId: "scas_4B7D2F9H"
                 status: "PENDING"
                 challengeUrl: "https://3ds.worldpay.com/challenge?session=scas_4B7D2F9H"
+                createdAt: "2026-07-01T06:00:00Z"
                 expiresAt: "2026-07-01T06:30:00Z"
+                respondBy: "2026-07-01T06:30:00Z"
 
   /v1/sca/sessions/{scaSessionId}:
     get:
@@ -286,11 +288,37 @@ paths:
           description: Session status
           content:
             application/json:
-              example:
-                scaSessionId: "scas_4B7D2F9H"
-                status: "COMPLETED"
-                paymentConsentId: "pci_9D2E5F8G"
-                completedAt: "2026-07-01T06:05:22Z"
+              examples:
+                pending:
+                  value:
+                    scaSessionId: "scas_4B7D2F9H"
+                    status: "PENDING"
+                    challengeUrl: "https://3ds.worldpay.com/challenge?session=scas_4B7D2F9H"
+                    createdAt: "2026-07-01T06:00:00Z"
+                    expiresAt: "2026-07-01T06:30:00Z"
+                    respondBy: "2026-07-01T06:30:00Z"
+                    paymentConsentId: null
+                    completedAt: null
+                completed:
+                  value:
+                    scaSessionId: "scas_4B7D2F9H"
+                    status: "COMPLETED"
+                    challengeUrl: "https://3ds.worldpay.com/challenge?session=scas_4B7D2F9H"
+                    createdAt: "2026-07-01T06:00:00Z"
+                    expiresAt: "2026-07-01T06:30:00Z"
+                    respondBy: "2026-07-01T06:30:00Z"
+                    paymentConsentId: "pci_9D2E5F8G"
+                    completedAt: "2026-07-01T06:05:22Z"
+                expired:
+                  value:
+                    scaSessionId: "scas_4B7D2F9H"
+                    status: "EXPIRED"
+                    createdAt: "2026-07-01T06:00:00Z"
+                    expiresAt: "2026-07-01T06:30:00Z"
+                    respondBy: "2026-07-01T06:30:00Z"
+                    paymentConsentId: null
+                    completedAt: null
+
     put:
       summary: Complete an SCA session (PSP callback handler)
       description: Called by the PSP adapter when the SCA challenge completes. Not called directly by experience layers.
@@ -317,16 +345,11 @@ paths:
                 scaSessionId: "scas_4B7D2F9H"
                 status: "COMPLETED"
                 paymentConsentId: "pci_9D2E5F8G"
-
-  # ── PAYMENT AGREEMENTS (MIT MANDATES) ────────────────────────────────────────
+                completedAt: "2026-07-01T06:05:22Z"
 
   /v1/payment-agreements:
     post:
       summary: Register a payment agreement (MIT mandate)
-      description: |
-        Registers a Merchant Initiated Transaction agreement — the customer's consent
-        for HX to charge their card without an active SCA session (e.g. balance collection).
-        Requires a valid paymentConsentId from a completed SCA session.
       operationId: registerPaymentAgreement
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -352,6 +375,8 @@ paths:
                 status: "ACTIVE"
                 agreementType: "BALANCE_COLLECTION"
                 registeredAt: "2026-07-01T06:00:00Z"
+                lastUsedAt: null
+                revokedAt: null
 
   /v1/payment-agreements/{paymentAgreementId}:
     get:
@@ -375,6 +400,7 @@ paths:
                 agreementType: "BALANCE_COLLECTION"
                 registeredAt: "2026-07-01T06:00:00Z"
                 lastUsedAt: null
+                revokedAt: null
     delete:
       summary: Revoke a payment agreement
       operationId: revokePaymentAgreement
@@ -392,16 +418,16 @@ paths:
               example:
                 paymentAgreementId: "pa_2C8F4A7E"
                 status: "REVOKED"
+                registeredAt: "2026-07-01T06:00:00Z"
                 revokedAt: "2026-07-01T08:00:00Z"
-
-  # ── SETTLEMENT RULES ─────────────────────────────────────────────────────────
 
   /v1/settlement-rules/{productType}:
     get:
       summary: Get settlement rules for a product type
       description: |
-        Returns the business rule for when payment must be settled for a given product type.
-        This is a domain-owned business rule — not calculated in the experience layer.
+        Returns the business rule for when payment must be settled for this product type.
+        Use the `offsetHours` with the booking's relevant datetime to compute `settlementDeadline`
+        in the experience layer.
       operationId: getSettlementRules
       parameters:
         - name: productType
@@ -410,7 +436,6 @@ paths:
           schema:
             type: string
             enum: [hotel, parking, lounge, insurance, transfer]
-          example: hotel
       responses:
         '200':
           description: Settlement rules
@@ -441,8 +466,12 @@ paths:
                     settlementRule: "AT_PURCHASE"
                     offsetHours: 0
                     description: "Payment settled at point of purchase — no deferred collection"
-
-  # ── TRANSACTION LEDGER ───────────────────────────────────────────────────────
+                transfer:
+                  value:
+                    productType: "transfer"
+                    settlementRule: "BEFORE_DEPARTURE"
+                    offsetHours: 72
+                    description: "Payment must be settled at least 72 hours before transfer time"
 
   /v1/transactions/{bookingReference}:
     get:
@@ -472,7 +501,10 @@ paths:
                     currency: "GBP"
                     status: "SETTLED"
                     paymentMethodToken: "pm_4X7K2M9N"
+                    authorisedAt: "2026-06-01T09:55:00Z"
                     capturedAt: "2026-06-01T10:00:00Z"
+                    settledAt: "2026-06-01T10:00:05Z"
+                    captureBy: null
                     authorisationId: "auth_5E6F7G8H"
                   - transactionId: "txn_9I0J1K2L"
                     type: "AUTHORISATION"
@@ -481,7 +513,10 @@ paths:
                     status: "AUTHORISED"
                     paymentMethodToken: "pm_4X7K2M9N"
                     authorisedAt: "2026-07-01T06:00:00Z"
+                    capturedAt: null
+                    settledAt: null
                     captureBy: "2026-07-02T06:00:00Z"
+                    expiresAt: "2026-07-02T06:00:00Z"
                     authorisationId: "auth_7H3K9M2P"
         '404':
           $ref: '#/components/responses/NotFound'
