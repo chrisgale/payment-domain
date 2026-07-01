@@ -2,14 +2,13 @@
  * Payment Domain API — Sandbox
  * Pure Node.js, no dependencies. Runs on http://localhost:3011
  *
- * Stateful in-memory store. Resets on restart.
  * All mutating endpoints require Idempotency-Key header.
+ * All responses with expiry/deadlines include explicit ISO 8601 time fields.
  */
 
 const http = require('http');
 const crypto = require('crypto');
 
-// ── In-memory store ──────────────────────────────────────────────────────────
 const store = {
   cardCaptureSessions: {},
   paymentMethods: {
@@ -17,14 +16,18 @@ const store = {
       {
         paymentMethodToken: 'pm_4X7K2M9N',
         type: 'card', scheme: 'visa', lastFour: '4242',
-        expiryMonth: 9, expiryYear: 2027, isDefault: true,
-        hasActiveAgreement: false, storedAt: '2025-11-03T14:22:00Z'
+        expiryMonth: 9, expiryYear: 2027,
+        cardExpiresAt: '2027-09-30T23:59:59Z',
+        isDefault: true, hasActiveAgreement: false,
+        storedAt: '2025-11-03T14:22:00Z'
       },
       {
         paymentMethodToken: 'pm_8B3J5L1P',
         type: 'card', scheme: 'mastercard', lastFour: '1234',
-        expiryMonth: 3, expiryYear: 2026, isDefault: false,
-        hasActiveAgreement: true, storedAt: '2024-06-18T09:10:00Z'
+        expiryMonth: 3, expiryYear: 2026,
+        cardExpiresAt: '2026-03-31T23:59:59Z',
+        isDefault: false, hasActiveAgreement: true,
+        storedAt: '2024-06-18T09:10:00Z'
       }
     ]
   },
@@ -40,7 +43,11 @@ const store = {
         {
           transactionId: 'txn_1A2B3C4D', type: 'CAPTURE', amount: 10000,
           currency: 'GBP', status: 'SETTLED', paymentMethodToken: 'pm_4X7K2M9N',
-          capturedAt: '2026-06-01T10:00:00Z', authorisationId: 'auth_5E6F7G8H'
+          authorisedAt: '2026-06-01T09:55:00Z',
+          capturedAt: '2026-06-01T10:00:00Z',
+          settledAt: '2026-06-01T10:00:05Z',
+          captureBy: null, expiresAt: null,
+          authorisationId: 'auth_5E6F7G8H'
         }
       ]
     }
@@ -49,28 +56,23 @@ const store = {
 };
 
 const settlementRules = {
-  hotel:     { productType: 'hotel',     settlementRule: 'BEFORE_CHECKIN',    offsetHours: 24, description: 'Payment must be settled at least 24 hours before check-in' },
-  parking:   { productType: 'parking',   settlementRule: 'BEFORE_DEPARTURE',  offsetHours: 48, description: 'Payment must be settled at least 48 hours before departure' },
-  lounge:    { productType: 'lounge',    settlementRule: 'BEFORE_ENTRY',      offsetHours: 0,  description: 'Payment must be settled before lounge entry' },
-  insurance: { productType: 'insurance', settlementRule: 'AT_PURCHASE',       offsetHours: 0,  description: 'Payment settled at point of purchase' },
-  transfer:  { productType: 'transfer',  settlementRule: 'BEFORE_DEPARTURE',  offsetHours: 72, description: 'Payment must be settled at least 72 hours before transfer time' }
+  hotel:     { productType: 'hotel',     settlementRule: 'BEFORE_CHECKIN',   offsetHours: 24, description: 'Payment must be settled at least 24 hours before check-in' },
+  parking:   { productType: 'parking',   settlementRule: 'BEFORE_DEPARTURE', offsetHours: 48, description: 'Payment must be settled at least 48 hours before departure' },
+  lounge:    { productType: 'lounge',    settlementRule: 'BEFORE_ENTRY',     offsetHours: 0,  description: 'Payment must be settled before lounge entry' },
+  insurance: { productType: 'insurance', settlementRule: 'AT_PURCHASE',      offsetHours: 0,  description: 'Payment settled at point of purchase' },
+  transfer:  { productType: 'transfer',  settlementRule: 'BEFORE_DEPARTURE', offsetHours: 72, description: 'Payment must be settled at least 72 hours before transfer time' }
 };
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function uid(prefix) {
-  return prefix + '_' + crypto.randomBytes(4).toString('hex').toUpperCase();
-}
-
+function uid(prefix) { return prefix + '_' + crypto.randomBytes(4).toString('hex').toUpperCase(); }
 function now() { return new Date().toISOString(); }
+function inMinutes(m) { return new Date(Date.now() + m * 60000).toISOString(); }
+function inHours(h) { return new Date(Date.now() + h * 3600000).toISOString(); }
 
 function parseBody(req) {
   return new Promise((resolve) => {
     let body = '';
     req.on('data', c => body += c);
-    req.on('end', () => {
-      try { resolve(JSON.parse(body || '{}')); }
-      catch { resolve({}); }
-    });
+    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch { resolve({}); } });
   });
 }
 
@@ -80,14 +82,12 @@ function send(res, status, body) {
   res.end(json);
 }
 
-// ── Router ───────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost:3011');
   const path = url.pathname;
   const method = req.method;
   const idempotencyKey = req.headers['idempotency-key'];
 
-  // Check idempotency cache for mutating requests
   if (['POST', 'PUT', 'DELETE'].includes(method) && idempotencyKey) {
     if (store.idempotencyCache[idempotencyKey]) {
       const cached = store.idempotencyCache[idempotencyKey];
@@ -109,7 +109,13 @@ const server = http.createServer(async (req, res) => {
   if (method === 'POST' && path === '/v1/payment-methods/sessions') {
     if (!body.customerId || !body.returnUrl) return reply(400, { error: 'BAD_REQUEST', message: 'customerId and returnUrl required' });
     const id = uid('ccs');
-    const session = { cardCaptureSessionId: id, redirectUrl: `https://secure.worldpay.com/hpp/paymentPage?token=${id}`, expiresAt: new Date(Date.now() + 30*60000).toISOString() };
+    const createdAt = now();
+    const expiresAt = inMinutes(30);
+    const session = {
+      cardCaptureSessionId: id,
+      redirectUrl: `https://secure.worldpay.com/hpp/paymentPage?token=${id}`,
+      createdAt, expiresAt, respondBy: expiresAt
+    };
     store.cardCaptureSessions[id] = session;
     return reply(201, session);
   }
@@ -117,10 +123,9 @@ const server = http.createServer(async (req, res) => {
   // GET /v1/payment-methods/:customerId
   const pmMatch = path.match(/^\/v1\/payment-methods\/([^/]+)$/);
   if (method === 'GET' && pmMatch) {
-    const cid = pmMatch[1];
-    const methods = store.paymentMethods[cid];
+    const methods = store.paymentMethods[pmMatch[1]];
     if (!methods) return reply(404, { error: 'NOT_FOUND', message: 'Customer not found' });
-    return reply(200, { customerId: cid, paymentMethods: methods });
+    return reply(200, { customerId: pmMatch[1], paymentMethods: methods });
   }
 
   // DELETE /v1/payment-methods/:customerId/:token
@@ -141,15 +146,29 @@ const server = http.createServer(async (req, res) => {
       return reply(400, { error: 'BAD_REQUEST', message: 'paymentMethodToken, amount, bookingReference required' });
     }
     const authId = uid('auth');
+    const authorisedAt = now();
+    const captureBy = inHours(24);
     const auth = {
       authorisationId: authId, status: 'AUTHORISED',
       amount: body.amount, currency: body.currency || 'GBP',
       bookingReference: body.bookingReference,
       scaToken: 'sca_' + crypto.randomBytes(4).toString('hex').toUpperCase(),
-      authorisedAt: now(),
-      captureBy: new Date(Date.now() + 24*60*60000).toISOString()
+      authorisedAt, captureBy, expiresAt: captureBy
     };
     store.authorisations[authId] = auth;
+    // Add pending transaction to ledger
+    const ref = body.bookingReference;
+    if (!store.transactions[ref]) {
+      store.transactions[ref] = { bookingReference: ref, totalAmount: body.amount, capturedAmount: 0, outstandingAmount: body.amount, currency: body.currency || 'GBP', transactions: [] };
+    }
+    store.transactions[ref].transactions.push({
+      transactionId: uid('txn'), type: 'AUTHORISATION', amount: body.amount,
+      currency: body.currency || 'GBP', status: 'AUTHORISED',
+      paymentMethodToken: body.paymentMethodToken,
+      authorisedAt, capturedAt: null, settledAt: null,
+      captureBy, expiresAt: captureBy,
+      authorisationId: authId
+    });
     return reply(201, auth);
   }
 
@@ -158,8 +177,11 @@ const server = http.createServer(async (req, res) => {
   if (method === 'POST' && captureMatch) {
     const auth = store.authorisations[captureMatch[1]];
     if (!auth) return reply(404, { error: 'NOT_FOUND', message: 'Authorisation not found' });
-    if (auth.status !== 'AUTHORISED') return reply(409, { error: 'INVALID_STATE', currentStatus: auth.status });
-    auth.status = 'CAPTURED'; auth.capturedAt = now();
+    if (auth.status !== 'AUTHORISED') {
+      return reply(409, { error: 'INVALID_STATE', currentStatus: auth.status, captureBy: auth.captureBy, message: auth.status === 'EXPIRED' ? 'Authorisation expired — a new authorisation is required' : `Cannot capture from status: ${auth.status}` });
+    }
+    const capturedAt = now();
+    auth.status = 'CAPTURED'; auth.capturedAt = capturedAt;
     return reply(200, auth);
   }
 
@@ -175,27 +197,35 @@ const server = http.createServer(async (req, res) => {
   // POST /v1/sca/sessions
   if (method === 'POST' && path === '/v1/sca/sessions') {
     const sessionId = uid('scas');
+    const createdAt = now();
+    const expiresAt = inMinutes(30);
     const session = {
       scaSessionId: sessionId, status: 'PENDING',
       challengeUrl: `https://3ds.worldpay.com/challenge?session=${sessionId}`,
-      expiresAt: new Date(Date.now() + 30*60000).toISOString()
+      createdAt, expiresAt, respondBy: expiresAt,
+      paymentConsentId: null, completedAt: null
     };
     store.scaSessions[sessionId] = session;
     return reply(201, session);
   }
 
   // GET /v1/sca/sessions/:id
-  const scaGetMatch = path.match(/^\/v1\/sca\/sessions\/([^/]+)$/);
-  if (method === 'GET' && scaGetMatch) {
-    const session = store.scaSessions[scaGetMatch[1]];
+  const scaMatch = path.match(/^\/v1\/sca\/sessions\/([^/]+)$/);
+  if (method === 'GET' && scaMatch) {
+    const session = store.scaSessions[scaMatch[1]];
     if (!session) return reply(404, { error: 'NOT_FOUND', message: 'SCA session not found' });
+    // Auto-expire in sandbox if past expiresAt
+    if (session.status === 'PENDING' && new Date(session.expiresAt) < new Date()) {
+      session.status = 'EXPIRED';
+    }
     return reply(200, session);
   }
 
-  // PUT /v1/sca/sessions/:id (PSP callback — auto-complete for sandbox)
-  if (method === 'PUT' && scaGetMatch) {
-    const session = store.scaSessions[scaGetMatch[1]];
+  // PUT /v1/sca/sessions/:id (PSP callback / sandbox complete)
+  if (method === 'PUT' && scaMatch) {
+    const session = store.scaSessions[scaMatch[1]];
     if (!session) return reply(404, { error: 'NOT_FOUND', message: 'SCA session not found' });
+    if (session.status === 'EXPIRED') return reply(409, { error: 'SESSION_EXPIRED', expiresAt: session.expiresAt, message: 'SCA session expired — a new session is required' });
     session.status = 'COMPLETED';
     session.paymentConsentId = uid('pci');
     session.completedAt = now();
@@ -209,14 +239,12 @@ const server = http.createServer(async (req, res) => {
     }
     const agreementId = uid('pa');
     const agreement = {
-      paymentAgreementId: agreementId,
-      customerId: body.customerId,
-      paymentMethodToken: body.paymentMethodToken,
-      status: 'ACTIVE', agreementType: body.agreementType || 'BALANCE_COLLECTION',
-      registeredAt: now(), lastUsedAt: null
+      paymentAgreementId: agreementId, customerId: body.customerId,
+      paymentMethodToken: body.paymentMethodToken, status: 'ACTIVE',
+      agreementType: body.agreementType || 'BALANCE_COLLECTION',
+      registeredAt: now(), lastUsedAt: null, revokedAt: null
     };
     store.paymentAgreements[agreementId] = agreement;
-    // Mark payment method
     const methods = store.paymentMethods[body.customerId] || [];
     const pm = methods.find(m => m.paymentMethodToken === body.paymentMethodToken);
     if (pm) pm.hasActiveAgreement = true;
@@ -258,30 +286,13 @@ const server = http.createServer(async (req, res) => {
     return reply(200, record);
   }
 
-  // Health
-  if (path === '/health') return send(res, 200, { status: 'ok', service: 'payment-domain-sandbox' });
+  if (path === '/health') return send(res, 200, { status: 'ok', service: 'payment-domain-sandbox', time: now() });
 
   send(res, 404, { error: 'NOT_FOUND', message: `No route: ${method} ${path}` });
 });
 
 server.listen(3011, () => {
-  console.log('Payment Domain sandbox running on http://localhost:3011');
-  console.log('');
-  console.log('Endpoints:');
-  console.log('  POST   /v1/payment-methods/sessions');
-  console.log('  GET    /v1/payment-methods/:customerId');
-  console.log('  DELETE /v1/payment-methods/:customerId/:token');
-  console.log('  POST   /v1/authorisations');
-  console.log('  POST   /v1/authorisations/:id/capture');
-  console.log('  POST   /v1/authorisations/:id/cancel');
-  console.log('  POST   /v1/sca/sessions');
-  console.log('  GET    /v1/sca/sessions/:id');
-  console.log('  PUT    /v1/sca/sessions/:id  (PSP callback / sandbox complete)');
-  console.log('  POST   /v1/payment-agreements');
-  console.log('  GET    /v1/payment-agreements/:id');
-  console.log('  DELETE /v1/payment-agreements/:id');
-  console.log('  GET    /v1/settlement-rules/:productType');
-  console.log('  GET    /v1/transactions/:bookingReference');
-  console.log('');
-  console.log('Test data: customer cust_HX_7823641, booking HX-2026-005678');
+  console.log('Payment Domain sandbox — http://localhost:3011');
+  console.log('All time-bounded responses include expiresAt, captureBy, respondBy, settlementDeadline');
+  console.log('Test data: cust_HX_7823641 / HX-2026-005678');
 });
